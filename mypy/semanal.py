@@ -51,7 +51,7 @@ Some important properties:
 from __future__ import annotations
 
 from contextlib import contextmanager
-from typing import Any, Callable, Iterable, Iterator, List, Optional, Set, TypeVar, cast
+from typing import Any, Callable, Iterable, Iterator, List, TypeVar, cast
 from typing_extensions import Final, TypeAlias as _TypeAlias
 
 from mypy import errorcodes as codes, message_registry
@@ -263,6 +263,7 @@ from mypy.types import (
     TypeVarLikeType,
     TypeVarType,
     UnboundType,
+    UnpackType,
     get_proper_type,
     get_proper_types,
     invalid_recursive_alias,
@@ -731,7 +732,7 @@ class SemanticAnalyzer(
         """
         scope = self.scope
         self.options = options
-        self.errors.set_file(file_node.path, file_node.fullname, scope=scope)
+        self.errors.set_file(file_node.path, file_node.fullname, scope=scope, options=options)
         self.cur_mod_node = file_node
         self.cur_mod_id = file_node.fullname
         with scope.module_scope(self.cur_mod_id):
@@ -830,6 +831,8 @@ class SemanticAnalyzer(
                     self.defer(defn)
                     return
                 assert isinstance(result, ProperType)
+                if isinstance(result, CallableType):
+                    result = self.remove_unpack_kwargs(defn, result)
                 defn.type = result
                 self.add_type_alias_deps(analyzer.aliases_used)
                 self.check_function_signature(defn)
@@ -871,6 +874,29 @@ class SemanticAnalyzer(
                 assert ret_type is not None, "Internal error: typing.Coroutine not found"
                 defn.type = defn.type.copy_modified(ret_type=ret_type)
                 self.wrapped_coro_return_types[defn] = defn.type
+
+    def remove_unpack_kwargs(self, defn: FuncDef, typ: CallableType) -> CallableType:
+        if not typ.arg_kinds or typ.arg_kinds[-1] is not ArgKind.ARG_STAR2:
+            return typ
+        last_type = get_proper_type(typ.arg_types[-1])
+        if not isinstance(last_type, UnpackType):
+            return typ
+        last_type = get_proper_type(last_type.type)
+        if not isinstance(last_type, TypedDictType):
+            self.fail("Unpack item in ** argument must be a TypedDict", defn)
+            new_arg_types = typ.arg_types[:-1] + [AnyType(TypeOfAny.from_error)]
+            return typ.copy_modified(arg_types=new_arg_types)
+        overlap = set(typ.arg_names) & set(last_type.items)
+        # It is OK for TypedDict to have a key named 'kwargs'.
+        overlap.discard(typ.arg_names[-1])
+        if overlap:
+            overlapped = ", ".join([f'"{name}"' for name in overlap])
+            self.fail(f"Overlap between argument names and ** TypedDict items: {overlapped}", defn)
+            new_arg_types = typ.arg_types[:-1] + [AnyType(TypeOfAny.from_error)]
+            return typ.copy_modified(arg_types=new_arg_types)
+        # OK, everything looks right now, mark the callable type as using unpack.
+        new_arg_types = typ.arg_types[:-1] + [last_type]
+        return typ.copy_modified(arg_types=new_arg_types, unpack_kwargs=True)
 
     def prepare_method_signature(self, func: FuncDef, info: TypeInfo) -> None:
         """Check basic signature validity and tweak annotation of self/cls argument."""
@@ -1215,8 +1241,9 @@ class SemanticAnalyzer(
             self.function_stack.pop()
 
     def check_classvar_in_signature(self, typ: ProperType) -> None:
+        t: ProperType
         if isinstance(typ, Overloaded):
-            for t in typ.items:  # type: ProperType
+            for t in typ.items:
                 self.check_classvar_in_signature(t)
             return
         if not isinstance(typ, CallableType):
@@ -1463,7 +1490,8 @@ class SemanticAnalyzer(
         ):
             # Don't reprocess everything. We just need to process methods defined
             # in the named tuple class body.
-            is_named_tuple, info = True, defn.info  # type: bool, Optional[TypeInfo]
+            is_named_tuple = True
+            info: TypeInfo | None = defn.info
         else:
             is_named_tuple, info = self.named_tuple_analyzer.analyze_namedtuple_classdef(
                 defn, self.is_stub_file, self.is_func_scope()
@@ -2980,7 +3008,13 @@ class SemanticAnalyzer(
                 self.fail("All protocol members must have explicitly declared types", s)
             # Set the type if the rvalue is a simple literal (even if the above error occurred).
             if len(s.lvalues) == 1 and isinstance(s.lvalues[0], RefExpr):
-                if s.lvalues[0].is_inferred_def:
+                ref_expr = s.lvalues[0]
+                safe_literal_inference = True
+                if self.type and isinstance(ref_expr, NameExpr) and len(self.type.mro) > 1:
+                    # Check if there is a definition in supertype. If yes, we can't safely
+                    # decide here what to infer: int or Literal[42].
+                    safe_literal_inference = self.type.mro[1].get(ref_expr.name) is None
+                if safe_literal_inference and ref_expr.is_inferred_def:
                     s.type = self.analyze_simple_literal_type(s.rvalue, s.is_final_def)
         if s.type:
             # Store type into nodes.
@@ -2998,7 +3032,6 @@ class SemanticAnalyzer(
 
     def analyze_simple_literal_type(self, rvalue: Expression, is_final: bool) -> Type | None:
         """Return builtins.int if rvalue is an int literal, etc.
-
         If this is a 'Final' context, we return "Literal[...]" instead."""
         if self.options.semantic_analysis_only or self.function_stack:
             # Skip this if we're only doing the semantic analysis pass.
@@ -3149,11 +3182,9 @@ class SemanticAnalyzer(
         res: Type | None = None
         if self.is_none_alias(rvalue):
             res = NoneType()
-            alias_tvars, depends_on, qualified_tvars = (
-                [],
-                set(),
-                [],
-            )  # type: List[str], Set[str], List[str]
+            alias_tvars: list[str] = []
+            depends_on: set[str] = set()
+            qualified_tvars: list[str] = []
         else:
             tag = self.track_incomplete_refs()
             res, alias_tvars, depends_on, qualified_tvars = self.analyze_alias(
@@ -3241,6 +3272,12 @@ class SemanticAnalyzer(
         current_node = existing.node if existing else alias_node
         assert isinstance(current_node, TypeAlias)
         self.disable_invalid_recursive_aliases(s, current_node)
+        if self.is_class_scope():
+            assert self.type is not None
+            if self.type.is_protocol:
+                self.fail("Type aliases are prohibited in protocol bodies", s)
+                if not lvalue.name[0].isupper():
+                    self.note("Use variable annotation syntax to define protocol members", s)
         return True
 
     def disable_invalid_recursive_aliases(
@@ -5107,6 +5144,11 @@ class SemanticAnalyzer(
                         if isinstance(typ, AnyType):
                             # Allow access through Var with Any type without error.
                             return self.implicit_symbol(sym, name, parts[i:], typ)
+                    # This might be something like valid `P.args` or invalid `P.__bound__` access.
+                    # Important note that `ParamSpecExpr` is also ignored in other places.
+                    # See https://github.com/python/mypy/pull/13468
+                    if isinstance(node, ParamSpecExpr) and part in ("args", "kwargs"):
+                        return None
                     # Lookup through invalid node, such as variable or function
                     nextsym = None
                 if not nextsym or nextsym.module_hidden:
@@ -5252,7 +5294,7 @@ class SemanticAnalyzer(
             return None
         node = sym.node
         if isinstance(node, TypeAlias):
-            assert isinstance(node.target, Instance)  # type: ignore
+            assert isinstance(node.target, Instance)  # type: ignore[misc]
             node = node.target.type
         assert isinstance(node, TypeInfo), node
         if args is not None:
@@ -5850,7 +5892,7 @@ class SemanticAnalyzer(
         current_index = len(self.function_stack) - 1
         while current_index >= 0:
             current_func = self.function_stack[current_index]
-            if isinstance(current_func, FuncItem) and not isinstance(current_func, LambdaExpr):
+            if not isinstance(current_func, LambdaExpr):
                 return not current_func.is_dynamic()
 
             # Special case, `lambda` inherits the "checked" state from its parent.

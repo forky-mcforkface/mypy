@@ -48,7 +48,7 @@ import os.path
 import sys
 import traceback
 from collections import defaultdict
-from typing import Dict, Iterable, List, Mapping, Optional, cast
+from typing import Iterable, List, Mapping, cast
 from typing_extensions import Final
 
 import mypy.build
@@ -643,7 +643,7 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
                 self.visit_func_def(item.func, is_abstract=is_abstract, is_overload=is_overload)
                 if is_overload:
                     overload_chain = True
-            elif overload_chain and is_overload:
+            elif is_overload:
                 self.visit_func_def(item.func, is_abstract=is_abstract, is_overload=is_overload)
             else:
                 # skip the overload implementation and clear the decorator we just processed
@@ -725,9 +725,7 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
                 retname = None  # implicit Any
             else:
                 retname = self.print_annotation(o.unanalyzed_type.ret_type)
-        elif isinstance(o, FuncDef) and (
-            o.abstract_status == IS_ABSTRACT or o.name in METHODS_WITH_RETURN_VALUE
-        ):
+        elif o.abstract_status == IS_ABSTRACT or o.name in METHODS_WITH_RETURN_VALUE:
             # Always assume abstract methods return Any unless explicitly annotated. Also
             # some dunder methods should not have a None return type.
             retname = None  # implicit Any
@@ -985,7 +983,7 @@ class StubGenerator(mypy.traverser.TraverserVisitor):
                 continue
             if isinstance(lvalue, TupleExpr) or isinstance(lvalue, ListExpr):
                 items = lvalue.items
-                if isinstance(o.unanalyzed_type, TupleType):  # type: ignore
+                if isinstance(o.unanalyzed_type, TupleType):  # type: ignore[misc]
                     annotations: Iterable[Type | None] = o.unanalyzed_type.items
                 else:
                     annotations = [None] * len(items)
@@ -1652,7 +1650,8 @@ def generate_stubs(options: Options) -> None:
     py_modules, c_modules = collect_build_targets(options, mypy_opts)
 
     # Collect info from docs (if given):
-    sigs = class_sigs = None  # type: Optional[Dict[str, str]]
+    sigs: dict[str, str] | None = None
+    class_sigs = sigs
     if options.doc_dir:
         sigs, class_sigs = collect_docs_signatures(options.doc_dir)
 
